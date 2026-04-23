@@ -516,25 +516,47 @@ function switchPlayers() {
   l.value = tmp;
 }
 
-// ---- ELO ----
+// ---- ELO (per session / date) ----
 function calcElo(stats) {
   const elo = {};
   S.players.forEach(p => elo[p] = 1000);
-  const sorted = [...S.results].sort((a,b) => {
-    if (a.date && b.date) return a.date.localeCompare(b.date);
-    return 0;
+
+  // Group results by date, skip noWinner
+  const sessions = {};
+  S.results.forEach(r => {
+    if (r.noWinner || !r.date) return;
+    if (!sessions[r.date]) sessions[r.date] = [];
+    sessions[r.date].push(r);
   });
-  sorted.forEach(r => {
-    if (r.noWinner) return;
-    if (elo[r.winner] === undefined || elo[r.loser] === undefined) return;
-    const Ra = elo[r.winner], Rb = elo[r.loser];
-    const Ea = 1 / (1 + Math.pow(10, (Rb - Ra) / 400));
-    const Eb = 1 - Ea;
-    const dom = (r.sw - r.sl) / (r.sw + r.sl);
-    const K = 32 * (1 + dom);
-    elo[r.winner] = Ra + K * (1 - Ea);
-    elo[r.loser]  = Rb + K * (0 - Eb);
-  });
+
+  function applySession(matches) {
+    const sp = {};
+    matches.forEach(r => {
+      [r.winner, r.loser].forEach(p => {
+        if (!sp[p]) sp[p] = { w: 0, l: 0, lw: 0, ll: 0, opponents: [] };
+      });
+      sp[r.winner].w++; sp[r.winner].lw += r.sw; sp[r.winner].ll += r.sl;
+      sp[r.loser].l++;  sp[r.loser].lw  += r.sl; sp[r.loser].ll  += r.sw;
+      sp[r.winner].opponents.push(r.loser);
+      sp[r.loser].opponents.push(r.winner);
+    });
+    const updates = {};
+    Object.entries(sp).forEach(([p, ps]) => {
+      if (elo[p] === undefined) return;
+      const total = ps.w + ps.l;
+      if (!total) return;
+      const S_score = ps.w / total;
+      const E_avg = ps.opponents.reduce((sum, opp) =>
+        sum + 1 / (1 + Math.pow(10, (elo[opp] - elo[p]) / 400)), 0) / ps.opponents.length;
+      const legs = ps.lw + ps.ll;
+      const dominance = legs > 0 ? (ps.lw - ps.ll) / legs : 0;
+      const K = 32 * (1 + 0.5 * dominance);
+      updates[p] = elo[p] + K * (S_score - E_avg);
+    });
+    Object.entries(updates).forEach(([p, r]) => { elo[p] = r; });
+  }
+
+  Object.keys(sessions).sort().forEach(date => applySession(sessions[date]));
   S.players.forEach(p => { if (stats[p]) stats[p].elo = Math.round(elo[p]); });
 }
 
@@ -575,9 +597,9 @@ function calcStats() {
   return s;
 }
 
-// Sort by ELO (primary), then win%, then leg diff
+// Sort by win% (primary), then leg diff, then ELO
 function sorted(stats) {
-  return Object.values(stats).sort((a,b) => b.elo-a.elo || b.pct-a.pct || b.diff-a.diff);
+  return Object.values(stats).sort((a,b) => b.pct-a.pct || b.diff-a.diff || b.elo-a.elo);
 }
 
 // ---- DAGWINNAARS ----
@@ -1236,32 +1258,60 @@ function removeFromQueue(idx) {
 }
 
 function calcQueueEloDeltas() {
-  // Start from current live ELO state
   const elo = {};
   S.players.forEach(p => elo[p] = 1000);
-  const historical = [...S.results].sort((a,b) => (a.date&&b.date) ? a.date.localeCompare(b.date) : 0);
-  historical.forEach(r => {
-    if (r.noWinner || elo[r.winner]===undefined || elo[r.loser]===undefined) return;
-    const Ra = elo[r.winner], Rb = elo[r.loser];
-    const Ea = 1 / (1 + Math.pow(10, (Rb - Ra) / 400));
-    const dom = (r.sw - r.sl) / (r.sw + r.sl);
-    const K = 32 * (1 + dom);
-    elo[r.winner] = Ra + K * (1 - Ea);
-    elo[r.loser]  = Rb + K * (0 - (1 - Ea));
+
+  function applySession(matches) {
+    const sp = {};
+    matches.forEach(r => {
+      [r.winner, r.loser].forEach(p => {
+        if (!sp[p]) sp[p] = { w: 0, l: 0, lw: 0, ll: 0, opponents: [] };
+      });
+      sp[r.winner].w++; sp[r.winner].lw += r.sw; sp[r.winner].ll += r.sl;
+      sp[r.loser].l++;  sp[r.loser].lw  += r.sl; sp[r.loser].ll  += r.sw;
+      sp[r.winner].opponents.push(r.loser);
+      sp[r.loser].opponents.push(r.winner);
+    });
+    const updates = {};
+    Object.entries(sp).forEach(([p, ps]) => {
+      if (elo[p] === undefined) return;
+      const total = ps.w + ps.l;
+      if (!total) return;
+      const S_score = ps.w / total;
+      const E_avg = ps.opponents.reduce((sum, opp) =>
+        sum + 1 / (1 + Math.pow(10, (elo[opp] - elo[p]) / 400)), 0) / ps.opponents.length;
+      const legs = ps.lw + ps.ll;
+      const dominance = legs > 0 ? (ps.lw - ps.ll) / legs : 0;
+      const K = 32 * (1 + 0.5 * dominance);
+      updates[p] = elo[p] + K * (S_score - E_avg);
+    });
+    Object.entries(updates).forEach(([p, r]) => { elo[p] = r; });
+  }
+
+  // Replay historical sessions
+  const historical = {};
+  S.results.forEach(r => {
+    if (r.noWinner || !r.date) return;
+    if (!historical[r.date]) historical[r.date] = [];
+    historical[r.date].push(r);
   });
-  // Now simulate each queued match in order, recording deltas
+  Object.keys(historical).sort().forEach(date => applySession(historical[date]));
+
+  // Simulate queue as one new session
+  const queueMatches = matchQueue.filter(m => !m.noWinner && elo[m.winner] !== undefined && elo[m.loser] !== undefined);
+  if (!queueMatches.length) return matchQueue.map(() => null);
+
+  const eloBefore = {};
+  S.players.forEach(p => { eloBefore[p] = elo[p]; });
+  applySession(queueMatches);
+
   return matchQueue.map(m => {
-    if (m.noWinner) return null;
-    if (elo[m.winner]===undefined || elo[m.loser]===undefined) return null;
-    const Ra = elo[m.winner], Rb = elo[m.loser];
-    const Ea = 1 / (1 + Math.pow(10, (Rb - Ra) / 400));
-    const dom = (m.sw - m.sl) / (m.sw + m.sl);
-    const K = 32 * (1 + dom);
-    const dw = Math.round(K * (1 - Ea));
-    const dl = Math.round(K * (0 - (1 - Ea)));
-    elo[m.winner] = Ra + K * (1 - Ea);
-    elo[m.loser]  = Rb + K * (0 - (1 - Ea));
-    return { winner: m.winner, loser: m.loser, dw, dl };
+    if (m.noWinner || elo[m.winner] === undefined || elo[m.loser] === undefined) return null;
+    return {
+      winner: m.winner, loser: m.loser,
+      dw: Math.round(elo[m.winner] - eloBefore[m.winner]),
+      dl: Math.round(elo[m.loser]  - eloBefore[m.loser])
+    };
   });
 }
 
