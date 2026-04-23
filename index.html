@@ -250,7 +250,7 @@
         <thead>
           <tr>
             <th>#</th><th>Speler</th><th>Gespeeld</th><th>W</th><th>V</th>
-            <th>W%</th><th>Leg diff</th><th>Vorm</th><th>Streak</th>
+            <th>W%</th><th>ELO</th><th>Leg diff</th><th>Vorm</th><th>Streak</th>
           </tr>
         </thead>
         <tbody id="stand-body"></tbody>
@@ -516,6 +516,28 @@ function switchPlayers() {
   l.value = tmp;
 }
 
+// ---- ELO ----
+function calcElo(stats) {
+  const elo = {};
+  S.players.forEach(p => elo[p] = 1000);
+  const sorted = [...S.results].sort((a,b) => {
+    if (a.date && b.date) return a.date.localeCompare(b.date);
+    return 0;
+  });
+  sorted.forEach(r => {
+    if (r.noWinner) return;
+    if (elo[r.winner] === undefined || elo[r.loser] === undefined) return;
+    const Ra = elo[r.winner], Rb = elo[r.loser];
+    const Ea = 1 / (1 + Math.pow(10, (Rb - Ra) / 400));
+    const Eb = 1 - Ea;
+    const dom = (r.sw - r.sl) / (r.sw + r.sl);
+    const K = 32 * (1 + dom);
+    elo[r.winner] = Ra + K * (1 - Ea);
+    elo[r.loser]  = Rb + K * (0 - Eb);
+  });
+  S.players.forEach(p => { if (stats[p]) stats[p].elo = Math.round(elo[p]); });
+}
+
 // ---- STATS CALC ----
 function calcStats() {
   const s = {};
@@ -543,17 +565,19 @@ function calcStats() {
     p.pct = p.played ? Math.round(p.wins/p.played*100) : 0;
     p.diff = p.lw - p.ll;
     p.legPct = (p.lw + p.ll) > 0 ? Math.round(p.lw / (p.lw + p.ll) * 100) : 0;
+    p.elo = 1000;
     const r5 = p.results.slice(-5);
     let cnt = 0, last = r5[r5.length-1];
     for (let i = r5.length-1; i>=0; i--) { if (r5[i]===last) cnt++; else break; }
     p.streak = last ? {type:last, n:cnt} : null;
   });
+  calcElo(s);
   return s;
 }
 
-// Sort by win% (primary), then leg diff
+// Sort by ELO (primary), then win%, then leg diff
 function sorted(stats) {
-  return Object.values(stats).sort((a,b) => b.pct-a.pct || b.diff-a.diff || b.wins-a.wins);
+  return Object.values(stats).sort((a,b) => b.elo-a.elo || b.pct-a.pct || b.diff-a.diff);
 }
 
 // ---- DAGWINNAARS ----
@@ -637,6 +661,7 @@ function renderStand() {
     }).join('');
     const streak = p.streak ? `<span class="streak-pill streak-${p.streak.type==='W'?'w':'l'}">${p.streak.type}${p.streak.n}</span>` : '<span style="color:var(--muted)">—</span>';
     const pctCol = p.pct >= 60 ? 'var(--green)' : p.pct <= 40 ? 'var(--red)' : 'var(--text)';
+    const eloColor = p.elo >= 1100 ? 'var(--green)' : p.elo <= 900 ? 'var(--red)' : 'var(--accent)';
     return `<tr>
       <td class="rank-num ${rnk}">${i+1}</td>
       <td class="player-name">${p.name}</td>
@@ -644,6 +669,7 @@ function renderStand() {
       <td style="color:var(--green);font-weight:600">${p.wins}</td>
       <td style="color:var(--red)">${p.losses}</td>
       <td style="color:${pctCol};font-family:'Barlow Condensed',sans-serif;font-size:17px;font-weight:700;">${p.pct}%</td>
+      <td style="color:${eloColor};font-family:'Barlow Condensed',sans-serif;font-size:17px;font-weight:700;">${p.elo}</td>
       <td>${diff}</td>
       <td><div class="form-dots">${form}</div></td>
       <td>${streak}</td>
@@ -1209,6 +1235,36 @@ function removeFromQueue(idx) {
   renderQueue();
 }
 
+function calcQueueEloDeltas() {
+  // Start from current live ELO state
+  const elo = {};
+  S.players.forEach(p => elo[p] = 1000);
+  const historical = [...S.results].sort((a,b) => (a.date&&b.date) ? a.date.localeCompare(b.date) : 0);
+  historical.forEach(r => {
+    if (r.noWinner || elo[r.winner]===undefined || elo[r.loser]===undefined) return;
+    const Ra = elo[r.winner], Rb = elo[r.loser];
+    const Ea = 1 / (1 + Math.pow(10, (Rb - Ra) / 400));
+    const dom = (r.sw - r.sl) / (r.sw + r.sl);
+    const K = 32 * (1 + dom);
+    elo[r.winner] = Ra + K * (1 - Ea);
+    elo[r.loser]  = Rb + K * (0 - (1 - Ea));
+  });
+  // Now simulate each queued match in order, recording deltas
+  return matchQueue.map(m => {
+    if (m.noWinner) return null;
+    if (elo[m.winner]===undefined || elo[m.loser]===undefined) return null;
+    const Ra = elo[m.winner], Rb = elo[m.loser];
+    const Ea = 1 / (1 + Math.pow(10, (Rb - Ra) / 400));
+    const dom = (m.sw - m.sl) / (m.sw + m.sl);
+    const K = 32 * (1 + dom);
+    const dw = Math.round(K * (1 - Ea));
+    const dl = Math.round(K * (0 - (1 - Ea)));
+    elo[m.winner] = Ra + K * (1 - Ea);
+    elo[m.loser]  = Rb + K * (0 - (1 - Ea));
+    return { winner: m.winner, loser: m.loser, dw, dl };
+  });
+}
+
 function renderQueue() {
   const el = document.getElementById('queue-list');
   const countEl = document.getElementById('queue-count');
@@ -1218,10 +1274,22 @@ function renderQueue() {
     document.getElementById('dag-preview').style.display = 'none';
     return;
   }
+  const eloDeltas = calcQueueEloDeltas();
   el.innerHTML = matchQueue.map((m, i) => {
-    const text = m.noWinner
-      ? `<span style="color:var(--muted);font-size:12px;">[vrij]</span> ${m.p1} <span style="color:var(--accent);">${m.s1}–${m.s2}</span> ${m.p2}`
-      : `<span style="font-weight:600;font-family:'Barlow Condensed',sans-serif;font-size:17px;">${m.winner}</span> <span style="color:var(--accent);font-family:'Barlow Condensed',sans-serif;">${m.sw}–${m.sl}</span> <span style="color:var(--muted);font-family:'Barlow Condensed',sans-serif;">${m.loser}</span>`;
+    let text, eloHtml = '';
+    if (m.noWinner) {
+      text = `<span style="color:var(--muted);font-size:12px;">[vrij]</span> ${m.p1} <span style="color:var(--accent);">${m.s1}–${m.s2}</span> ${m.p2}`;
+    } else {
+      const d = eloDeltas[i];
+      const eloBadge = (name, delta) => {
+        const sign = delta >= 0 ? '+' : '';
+        const col = delta >= 0 ? 'var(--green)' : 'var(--red)';
+        return `<span style="font-family:'Barlow Condensed',sans-serif;font-size:12px;color:${col};font-weight:700;opacity:0.85;">${sign}${delta}</span>`;
+      };
+      const winnerElo = d ? eloBadge(m.winner, d.dw) : '';
+      const loserElo  = d ? eloBadge(m.loser,  d.dl) : '';
+      text = `<span style="font-weight:600;font-family:'Barlow Condensed',sans-serif;font-size:17px;">${m.winner}</span> ${winnerElo} <span style="color:var(--accent);font-family:'Barlow Condensed',sans-serif;margin:0 4px;">${m.sw}–${m.sl}</span> <span style="color:var(--muted);font-family:'Barlow Condensed',sans-serif;">${m.loser}</span> ${loserElo}`;
+    }
     return `<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);">
       <div>${text}</div>
       <button class="del-btn" onclick="removeFromQueue(${i})" title="Verwijder">×</button>
